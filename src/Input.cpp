@@ -1,5 +1,8 @@
 #include "Input.h"
 #include "Config.h"
+#include "Application.h"
+#include "WindowManager.h"
+#include "GamepadNavigation.h"
 #include "imgui.h"
 
 #include <algorithm>
@@ -281,12 +284,39 @@ namespace {
     float g_cursorY = -1.0f;
 }
 
+void UI::UpdateActiveInputDevice(RE::InputEvent* const* events) {
+    for (auto event = *events; event; event = event->next) {
+        if (const auto button = event->AsButtonEvent()) {
+            if (!button->HasIDCode() || !button->IsDown()) {
+                continue;
+            }
+            const auto device = button->GetDevice();
+            if (device == RE::INPUT_DEVICE::kKeyboard || device == RE::INPUT_DEVICE::kMouse) {
+                activeInputDevice = RE::INPUT_DEVICE::kKeyboard;
+            } else if (device == RE::INPUT_DEVICE::kGamepad) {
+                activeInputDevice = RE::INPUT_DEVICE::kGamepad;
+            }
+        } else if (const auto mouse = event->AsMouseMoveEvent()) {
+            if (mouse->mouseInputX != 0 || mouse->mouseInputY != 0) {
+                activeInputDevice = RE::INPUT_DEVICE::kKeyboard;
+            }
+        } else if (const auto stick = event->AsThumbstickEvent()) {
+            if (std::abs(stick->xValue) > kStickDeadzone || std::abs(stick->yValue) > kStickDeadzone) {
+                activeInputDevice = RE::INPUT_DEVICE::kGamepad;
+            }
+        }
+    }
+}
+
 // The left stick mirrors the d-pad for ImGui navigation; the right stick drives
 // the cursor. Without the latter there is no controller route to any
 // pointer-driven widget (sliders, drags, window title bars), while
 // io.MouseDrawCursor is on.
 inline void TranslateThumbstickEvent(ImGuiIO& io, const RE::ThumbstickEvent* stick) {
     if (stick->IsLeft()) {
+        if (std::abs(stick->xValue) > kStickDeadzone || std::abs(stick->yValue) > kStickDeadzone) {
+            UI::GamepadNavigation::NotifyGamepadAnalogInput();
+        }
         io.AddKeyEvent(ImGuiKey_GamepadLStickLeft, stick->xValue < -kStickDeadzone);
         io.AddKeyEvent(ImGuiKey_GamepadLStickRight, stick->xValue > kStickDeadzone);
         io.AddKeyEvent(ImGuiKey_GamepadLStickUp, stick->yValue > kStickDeadzone);
@@ -300,9 +330,14 @@ inline void TranslateThumbstickEvent(ImGuiIO& io, const RE::ThumbstickEvent* sti
 
     const float x = std::abs(stick->xValue) > kStickDeadzone ? stick->xValue : 0.0f;
     const float y = std::abs(stick->yValue) > kStickDeadzone ? stick->yValue : 0.0f;
+    io.AddKeyEvent(ImGuiKey_GamepadRStickLeft, x < 0.0f);
+    io.AddKeyEvent(ImGuiKey_GamepadRStickRight, x > 0.0f);
+    io.AddKeyEvent(ImGuiKey_GamepadRStickUp, y > 0.0f);
+    io.AddKeyEvent(ImGuiKey_GamepadRStickDown, y < 0.0f);
     if (x == 0.0f && y == 0.0f) {
         return;
     }
+    UI::GamepadNavigation::NotifyGamepadAnalogInput();
 
     if (g_cursorX < 0.0f || g_cursorY < 0.0f) {
         const bool hasCursor = io.MousePos.x > -FLT_MAX && io.MousePos.y > -FLT_MAX;
@@ -319,6 +354,9 @@ inline void TranslateThumbstickEvent(ImGuiIO& io, const RE::ThumbstickEvent* sti
 inline void TranslateButtonEvent(ImGuiIO& io, const RE::ButtonEvent* button) {
     if (!button->HasIDCode()) {
         return;
+    }
+    if (button->IsPressed()) {
+        UI::GamepadNavigation::NotifyInputDevice(button->GetDevice());
     }
 
     switch (button->GetDevice()) {
@@ -355,15 +393,106 @@ inline void TranslateButtonEvent(ImGuiIO& io, const RE::ButtonEvent* button) {
     }
 }
 
-void UI::TranslateInputEvent(RE::InputEvent* const* a_event) {
+void UI::KeyBindingCapture::Begin(RE::INPUT_DEVICE targetDevice) {
+    std::scoped_lock lock(mutex);
+    captureDevice = targetDevice;
+    device = targetDevice;
+    state = State::Waiting;
+}
+
+void UI::KeyBindingCapture::BeginConfirmation() {
+    std::scoped_lock lock(mutex);
+    device = RE::INPUT_DEVICE::kNone;
+    key = UnboundKey;
+    state = State::Confirming;
+}
+
+bool UI::KeyBindingCapture::IsConfirming() const {
+    return state.load() == State::Confirming;
+}
+
+void UI::KeyBindingCapture::Reset() {
+    std::scoped_lock lock(mutex);
+    state = State::Idle;
+}
+
+bool UI::KeyBindingCapture::Process(RE::InputEvent* const* events) {
+    if (state.load() == State::Idle) {
+        return false;
+    }
+    std::scoped_lock lock(mutex);
+    if (!WindowManager::ConfigInterface || !WindowManager::ConfigInterface->IsOpen.load()) {
+        state = State::Idle;
+    }
+    if (state == State::Idle) {
+        return false;
+    }
+    if (state == State::Cancelled) {
+        return true;
+    }
+
+    for (auto event = *events; event; event = event->next) {
+        const auto button = event->AsButtonEvent();
+        if (!button || !button->HasIDCode()) {
+            continue;
+        }
+        const auto eventDevice = button->GetDevice();
+        const auto eventKey = button->GetIDCode();
+        const bool cancel = eventDevice == RE::INPUT_DEVICE::kKeyboard && eventKey == REX::W32::DIK_ESCAPE;
+        if (state == State::Confirming) {
+            // Require a fresh raw press; ImGui may still have the captured B press/release queued.
+            if (cancel || (eventDevice == RE::INPUT_DEVICE::kGamepad && eventKey == RE::BSWin32GamepadDevice::Key::kB)) {
+                if (button->IsDown()) {
+                    device = eventDevice;
+                    key = eventKey;
+                } else if (eventDevice == device && eventKey == key && button->IsUp()) {
+                    state = State::Cancelled;
+                    return true;
+                }
+            }
+            continue;
+        }
+        if (button->IsDown() && (cancel || (state == State::Waiting && eventDevice == device &&
+                eventKey != UnboundKey && GetKeyName(eventKey, device) != "UNKNOWN"))) {
+            device = eventDevice;
+            key = eventKey;
+            state = State::Pressed;
+        } else if (state == State::Pressed && eventDevice == device && eventKey == key && button->IsUp()) {
+            state = cancel ? State::Cancelled : State::Complete;
+        }
+    }
+    // Keep shielding the input until the Settings UI has acknowledged completion.
+    return true;
+}
+
+UI::KeyBindingCapture::State UI::KeyBindingCapture::Poll(unsigned int& capturedKey, RE::INPUT_DEVICE displayedDevice) {
+    std::scoped_lock lock(mutex);
+    if (captureDevice != displayedDevice && state != State::Pressed) {
+        state = State::Idle;
+    }
+    const auto result = state.load();
+    if (state == State::Complete || state == State::Cancelled) {
+        capturedKey = key;
+        state = State::Idle;
+    }
+    return result;
+}
+
+void UI::TranslateInputEvent(RE::InputEvent* const* a_event, bool capturingBinding) {
     auto& io = ImGui::GetIO();
 
     for (auto event = *a_event; event; event = event->next) {
         if (auto button = event->AsButtonEvent()) {
-            TranslateButtonEvent(io, button);
+            // Release the input that opened capture, and keep mouse Cancel/Clear usable.
+            if (!capturingBinding || button->GetDevice() == RE::INPUT_DEVICE::kMouse || button->IsUp()) {
+                TranslateButtonEvent(io, button);
+            }
+        } else if (capturingBinding) {
+            continue;
         } else if (auto thumbstick = event->AsThumbstickEvent()) {
             TranslateThumbstickEvent(io, thumbstick);
         } else if (auto charEvent = event->AsCharEvent()) {
+            GamepadNavigation::NotifyInputDevice(RE::INPUT_DEVICE::kKeyboard);
             io.AddInputCharacter(charEvent->keyCode);
         }
     }

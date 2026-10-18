@@ -21,6 +21,18 @@ namespace {
     ImGuiVRHelperPluginAPI::Client g_vrHelper;
     HWND g_outputWindow = nullptr;
 
+    void SyncImGuiGamepadAvailability() {
+        ImGuiIO& io = ImGui::GetIO();
+        RE::BSInputDeviceManager* inputDeviceManager = RE::BSInputDeviceManager::GetSingleton();
+        const bool gamepadAvailable = inputDeviceManager && inputDeviceManager->IsGamepadEnabled();
+
+        if (gamepadAvailable) {
+            io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+        } else {
+            io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+        }
+    }
+
     bool CenterMouseCursorInWindow() {
         if (!g_outputWindow) {
             return false;
@@ -49,6 +61,7 @@ namespace {
 }
 
 void Hooks::Install() {
+    SKSE::AllocTrampoline(14*4);
     D3DInitHook::install();
     RenderUIHook::install();
     ProcessInputQueueHook::install();
@@ -74,17 +87,14 @@ void Hooks::ConnectVRHelper() {
 }
 
 void Hooks::D3DInitHook::install() {
-    SKSE::AllocTrampoline(14);
     auto& trampoline = SKSE::GetTrampoline();
     originalFunction = trampoline.write_call<5>(
         REL::RelocationID(75595, 77226, 75595).address() + REL::Relocate(0x9, 0x275, 0x9), thunk);
 }
 
 void Hooks::RenderUIHook::install() {
-    SKSE::AllocTrampoline(14);
     auto& trampoline = SKSE::GetTrampoline();
     originalFunction1 = trampoline.write_call<5>(REL::RelocationID(35556, 36555, 35556).address() + REL::Relocate(0x3ab, 0x371, 0x355), thunk1);
-    SKSE::AllocTrampoline(14);
 
     const auto version = REL::Module::get().version();
     const auto is_version_1_7 = version.major() == 1 && version.minor() == 7;
@@ -95,7 +105,6 @@ void Hooks::RenderUIHook::install() {
 }
 
 void Hooks::ProcessInputQueueHook::install() {
-    SKSE::AllocTrampoline(14);
     auto& trampoline = SKSE::GetTrampoline();
     originalFunction = trampoline.write_call<5>(
         REL::RelocationID(67315, 68617, 67315).address() + REL::Relocate(0x7B, 0x7B, 0x81), thunk);
@@ -143,6 +152,13 @@ RE::InputEvent** RemoveNonPrintScreenInputs(RE::InputEvent** a_event) {
 
 void Hooks::ProcessInputQueueHook::thunk(RE::BSTEventSource<RE::InputEvent*>* a_dispatcher,
                                       RE::InputEvent* const* a_event) {
+    UI::UpdateActiveInputDevice(a_event);
+    if (UI::keyBindingCapture.Process(a_event)) {
+        UI::TranslateInputEvent(a_event, !UI::keyBindingCapture.IsConfirming());
+        constexpr RE::InputEvent* const empty[] = {nullptr};
+        originalFunction(a_dispatcher, empty);
+        return;
+    }
     bool isInputCapturedByOpenClose = UI::Renderer::ProcessOpenClose(a_event);
 
     if (!ImGui::IsAnyItemActive()) {
@@ -164,6 +180,7 @@ void Hooks::ProcessInputQueueHook::thunk(RE::BSTEventSource<RE::InputEvent*>* a_
 
 LRESULT Hooks::WndProcHook::thunk(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_KILLFOCUS) {
+        UI::keyBindingCapture.Reset();
         auto& io = ImGui::GetIO();
         io.ClearInputKeys();
     }
@@ -276,6 +293,10 @@ void Render() {
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    // The Win32 backend only refreshes its XInput capability after receiving
+    // WM_DEVICECHANGE. Skyrim owns the window procedure and may not forward
+    // that message, so use the game's live device state for hot-plug support.
+    SyncImGuiGamepadAvailability();
     // When connected, size to the helper's panel canvas so wand UV and our own
     // layout share one coordinate space, instead of the flat mirror's resolution.
     if (!g_vrHelper.IsConnected() || !g_vrHelper.ApplyPanelDisplaySize()) {
